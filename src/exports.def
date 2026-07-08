@@ -1,0 +1,4 @@
+LIBRARY "ArchiveThumbnailProvider"
+EXPORTS
+    DllCanUnloadNow     PRIVATE
+    DllGetClassObject   PRIVATE
