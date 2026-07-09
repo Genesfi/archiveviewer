@@ -6,6 +6,9 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -111,7 +114,7 @@ static void LogDebug(const char* format, ...) {
 }
 
 // Helper to run a command hidden and redirect stdout to string
-bool RunCommandAndGetOutput(const std::wstring& cmd, std::string& output, int& exitCode) {
+bool RunCommandAndGetOutput(const std::wstring& cmd, std::string& output, int& exitCode, const bool* pCancelFlag = nullptr) {
     LogDebug("RunCommand: %ls", cmd.c_str());
     
     HANDLE hChildStd_OUT_Rd = NULL;
@@ -156,8 +159,38 @@ bool RunCommandAndGetOutput(const std::wstring& cmd, std::string& output, int& e
     DWORD dwRead;
     CHAR chBuf[4096];
     output.clear();
-    while (ReadFile(hChildStd_OUT_Rd, chBuf, sizeof(chBuf) - 1, &dwRead, NULL) && dwRead > 0) {
-        output.append(chBuf, dwRead);
+    
+    bool aborted = false;
+    while (true) {
+        if (pCancelFlag && *pCancelFlag) {
+            TerminateProcess(piProcInfo.hProcess, 1);
+            aborted = true;
+            break;
+        }
+
+        DWORD dwReadAvail = 0;
+        if (PeekNamedPipe(hChildStd_OUT_Rd, NULL, 0, NULL, &dwReadAvail, NULL) && dwReadAvail > 0) {
+            if (ReadFile(hChildStd_OUT_Rd, chBuf, sizeof(chBuf) - 1, &dwRead, NULL) && dwRead > 0) {
+                output.append(chBuf, dwRead);
+            }
+        } else {
+            DWORD dwWait = WaitForSingleObject(piProcInfo.hProcess, 50);
+            if (dwWait == WAIT_OBJECT_0) {
+                // Read remaining data
+                while (ReadFile(hChildStd_OUT_Rd, chBuf, sizeof(chBuf) - 1, &dwRead, NULL) && dwRead > 0) {
+                    output.append(chBuf, dwRead);
+                }
+                break;
+            }
+        }
+    }
+    
+    if (aborted) {
+        CloseHandle(piProcInfo.hProcess);
+        CloseHandle(piProcInfo.hThread);
+        CloseHandle(hChildStd_OUT_Rd);
+        LogDebug("RunCommand: Aborted due to cancellation.");
+        return false;
     }
     
     WaitForSingleObject(piProcInfo.hProcess, INFINITE);
@@ -170,9 +203,6 @@ bool RunCommandAndGetOutput(const std::wstring& cmd, std::string& output, int& e
     CloseHandle(hChildStd_OUT_Rd);
     
     LogDebug("RunCommand: Finished. ExitCode: %d, Output Size: %u", exitCode, output.size());
-    if (exitCode != 0 && output.size() < 1000) {
-        LogDebug("RunCommand: Stderr/Stdout error info: %s", output.c_str());
-    }
     return true;
 }
 
@@ -213,6 +243,7 @@ std::vector<ArchiveFileInfo> Parse7ZipOutput(const std::string& output) {
     
     ArchiveFileInfo currentItem;
     bool hasItem = false;
+    bool headerPassed = false;
     
     auto Trim = [](const std::string& s) -> std::string {
         auto start = s.find_first_not_of(" \t\r\n");
@@ -230,9 +261,15 @@ std::vector<ArchiveFileInfo> Parse7ZipOutput(const std::string& output) {
         line = Trim(line);
         if (line.empty()) continue;
 
-        if (line.rfind("----------", 0) == 0 || line.rfind("--", 0) == 0) {
+        if (line.rfind("----------", 0) == 0) {
+            headerPassed = true;
             continue;
         }
+        if (line.rfind("--", 0) == 0) {
+            continue;
+        }
+
+        if (!headerPassed) continue;
         
         std::size_t eqPos = line.find('=');
         if (eqPos != std::string::npos) {
@@ -463,7 +500,7 @@ bool ArchiveReader::Open(const std::wstring& archivePath, const std::wstring& pa
 
     std::string output;
     int exitCode = 0;
-    if (!RunCommandAndGetOutput(cmd, output, exitCode)) {
+    if (!RunCommandAndGetOutput(cmd, output, exitCode, m_pCancelFlag)) {
         m_impl.reset();
         return false;
     }
@@ -502,7 +539,7 @@ bool ArchiveReader::Open(const std::wstring& archivePath, const std::wstring& pa
             
             std::string testOut;
             int testCode = 0;
-            if (RunCommandAndGetOutput(testCmd, testOut, testCode) && testCode != 0) {
+            if (RunCommandAndGetOutput(testCmd, testOut, testCode, m_pCancelFlag) && testCode != 0) {
                 m_impl.reset();
                 return false;
             }
@@ -690,7 +727,7 @@ bool ArchiveReader::ExtractFileToMemory(const std::string& internalPath, std::ve
 
         std::string output;
         int exitCode = 0;
-        if (!RunCommandAndGetOutput(cmd, output, exitCode) || exitCode != 0) {
+        if (!RunCommandAndGetOutput(cmd, output, exitCode, m_pCancelFlag) || exitCode != 0) {
             return false;
         }
 
@@ -726,10 +763,9 @@ bool ArchiveReader::ExtractAll(const std::wstring& destDirectoryPath) const {
     if (!m_isOpen || !m_impl) return false;
 
     if (m_impl->use7Zip) {
-        // Create the destination directory first
         CreateDirectories(destDirectoryPath);
         
-        std::wstring cmd = L"\"" + m_impl->sevenZipPath + L"\" x -y -sccUTF-8 -o\"" + destDirectoryPath + L"\" \"" + m_archivePath + L"\"";
+        std::wstring cmd = L"\"" + m_impl->sevenZipPath + L"\" e -y -sccUTF-8 -o\"" + destDirectoryPath + L"\" \"" + m_archivePath + L"\"";
         if (!m_password.empty()) {
             cmd += L" -p\"" + m_password + L"\"";
         } else {
@@ -738,26 +774,23 @@ bool ArchiveReader::ExtractAll(const std::wstring& destDirectoryPath) const {
 
         std::string output;
         int exitCode = 0;
-        if (!RunCommandAndGetOutput(cmd, output, exitCode) || exitCode != 0) {
+        if (!RunCommandAndGetOutput(cmd, output, exitCode, m_pCancelFlag) || exitCode != 0) {
             return false;
         }
         return true;
     }
     
-    // For ZIP using miniz:
     std::vector<ArchiveFileInfo> files = ListFiles();
     for (const auto& file : files) {
-        std::wstring destPath = destDirectoryPath + L"\\" + file.name;
+        if (file.isDirectory) continue;
+
+        std::wstring destPath = destDirectoryPath + L"\\" + fs::path(file.name).filename().wstring();
         for (auto& ch : destPath) {
             if (ch == L'/') ch = L'\\';
         }
 
-        if (file.isDirectory) {
-            CreateDirectories(destPath);
-        } else {
-            if (!ExtractFileToDisk(file.internalPath, destPath)) {
-                return false;
-            }
+        if (!ExtractFileToDisk(file.internalPath, destPath)) {
+            return false;
         }
     }
     return true;

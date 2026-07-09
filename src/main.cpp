@@ -1,5 +1,8 @@
+#define WIN32_LEAN_AND_MEAN
+#define _WIN32_WINNT 0x0600
 #define NOMINMAX
 #include <windows.h>
+#include <shlobj.h>
 #include <gdiplus.h>
 #include <shobjidl.h>
 #include <shellapi.h>
@@ -34,7 +37,9 @@ namespace fs = std::filesystem;
 #define IDC_SETTINGS_BTN  106
 
 // Custom window message for background scanning notifications
-#define WM_USER_SCAN_ITEM  (WM_USER + 101)
+#define WM_USER_SCAN_ITEM       (WM_USER + 101)
+#define WM_USER_METADATA_LOADED (WM_USER + 103)
+#define WM_USER_NEED_PASSWORD   (WM_USER + 104)
 
 #define IDC_VIEW_TOGGLE_BTN 107
 #define IDC_GRID_VIEW_WND   108
@@ -49,6 +54,7 @@ struct ArchiveItem {
     std::wstring currentPassword;
     std::wstring tempExtractDir; // Path to temp folder if already extracted, else L""
     bool extractionFinished;    // True if background ExtractAll completed
+    bool metadataLoaded;        // True if metadata scanning is complete (success/empty/fail)
 };
 
 // Global variables
@@ -68,6 +74,7 @@ bool g_bDraggingSplitter = false;
 bool g_bGridView = false;
 HWND g_hGridViewWnd = NULL;
 HWND g_hViewToggleBtn = NULL;
+int g_priorityIndex = -1;
 
 CRITICAL_SECTION g_csArchives;
 HWND g_hMainWnd = NULL;
@@ -76,15 +83,43 @@ bool g_bCancelScan = false;
 
 // Extraction globals
 CRITICAL_SECTION g_csTempExtract;
-HANDLE g_hExtractThread = NULL;
-bool g_bCancelExtract = false;
-std::wstring g_currentArchiveExtracting; // filePath of archive currently being extracted
 std::vector<std::wstring> g_tempDirsCreated; // Keep track of all created temp folders to delete them on exit
 
 // Grid loader globals
 CRITICAL_SECTION g_csGridLoad;
 HANDLE g_hGridLoadThread = NULL;
 bool g_bCancelGridLoad = false;
+int g_gridLoadSessionId = 0;
+volatile bool g_bPauseBackgroundScan = false;
+int g_metadataSessionId = 0;
+
+// Grid item cache - declared here for forward use in LoadMetadataThread
+struct GridItemCache {
+    std::wstring name;
+    std::string internalPath;
+    Gdiplus::Bitmap* pBitmap;
+    bool loadAttempted;
+};
+CRITICAL_SECTION g_csGridItems;
+std::vector<GridItemCache> g_gridItems;
+
+static void LogDebug(const char* format, ...) {
+    wchar_t tempPath[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempPath);
+    std::wstring logPath = std::wstring(tempPath) + L"ArchivePreviewerDebug.txt";
+    FILE* f = _wfopen(logPath.c_str(), L"a");
+    if (f) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        fprintf(f, "[APP %02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+        va_list args;
+        va_start(args, format);
+        vfprintf(f, format, args);
+        va_end(args);
+        fprintf(f, "\n");
+        fclose(f);
+    }
+}
 
 // Function declarations
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -94,53 +129,120 @@ void ClearArchives();
 void UpdateContentsList(int archiveIndex);
 void ExtractSelectedArchive(int index);
 bool IsImageFile(const std::wstring& filename);
-Bitmap* LoadImageFromMemory(const char* data, size_t size);
+Bitmap* LoadThumbnailFromMemory(const char* data, size_t size, int thumbWidth, int thumbHeight);
 Bitmap* CreateThumbnail(Bitmap* pSource, int thumbWidth, int thumbHeight);
 INT_PTR ShowPasswordPromptDialog(HWND hwndParent, const std::wstring& archivePath, std::wstring& outPassword, bool& outSavePassword);
 void ShowSettingsDialog(HWND hwndParent);
 bool OpenArchiveWithPasswordSupport(ArchiveReader& reader, const std::wstring& archivePath, HWND hwndParent, std::wstring& outPassword);
+void UpdateGridItems(const std::vector<ArchiveFileInfo>& files, const std::wstring& archivePath, const std::wstring& password);
 
-struct ExtractThreadParams {
-    std::wstring archivePath;
-    std::wstring password;
-    std::wstring tempDir;
+
+
+// Struct for background thread parameters
+struct LoadMetadataParams {
+    HWND hWnd;
     int archiveIndex;
+    std::wstring filePath;
+    int sessionId;
 };
 
-DWORD WINAPI ExtractArchiveThread(LPVOID lpParam) {
-    ExtractThreadParams* params = (ExtractThreadParams*)lpParam;
-    std::wstring archivePath = params->archivePath;
-    std::wstring password = params->password;
-    std::wstring tempDir = params->tempDir;
+DWORD WINAPI LoadMetadataThread(LPVOID lpParam) {
+    LoadMetadataParams* params = (LoadMetadataParams*)lpParam;
+    HWND hWnd = params->hWnd;
     int archiveIndex = params->archiveIndex;
-    delete params;
-
-    ArchiveReader reader;
-    if (reader.Open(archivePath, password)) {
-        reader.ExtractAll(tempDir);
-    }
-
-    EnterCriticalSection(&g_csTempExtract);
+    std::wstring filePath = params->filePath;
+    int sessionId = params->sessionId;
+    
+    std::wstring savedPwd;
     EnterCriticalSection(&g_csArchives);
-    if (archiveIndex >= 0 && archiveIndex < (int)g_archives.size() && g_archives[archiveIndex].filePath == archivePath) {
-        g_archives[archiveIndex].extractionFinished = true;
-        if (g_hGridViewWnd) {
-            InvalidateRect(g_hGridViewWnd, NULL, TRUE);
-        }
+    if (archiveIndex >= 0 && archiveIndex < (int)g_archives.size()) {
+        savedPwd = g_archives[archiveIndex].currentPassword;
     }
     LeaveCriticalSection(&g_csArchives);
-    
-    if (g_hExtractThread) {
-        CloseHandle(g_hExtractThread);
-        g_hExtractThread = NULL;
-    }
-    g_currentArchiveExtracting.clear();
-    LeaveCriticalSection(&g_csTempExtract);
+    delete params;
 
+    LogDebug("LoadMetadataThread: Started for index %d, session %d", archiveIndex, sessionId);
+
+    // Pause background scanner to allocate all resources to this opening process
+    g_bPauseBackgroundScan = true;
+
+    ArchiveReader reader;
+    bool opened = false;
+    
+    // Try opening, retry up to 5 times (100ms delay) to avoid sharing conflicts
+    for (int retry = 0; retry < 5; ++retry) {
+        if (reader.Open(filePath, savedPwd)) {
+            opened = true;
+            break;
+        } else if (reader.IsEncrypted()) {
+            EnterCriticalSection(&g_csGridLoad);
+            bool sessionValid = (g_metadataSessionId == sessionId);
+            LeaveCriticalSection(&g_csGridLoad);
+            
+            LogDebug("LoadMetadataThread: Encrypted. sessionValid=%d", sessionValid);
+            if (sessionValid) {
+                PostMessageW(hWnd, WM_USER_NEED_PASSWORD, (WPARAM)archiveIndex, (LPARAM)sessionId);
+            }
+            g_bPauseBackgroundScan = false;
+            return 0;
+        }
+        Sleep(100);
+    }
+
+    LogDebug("LoadMetadataThread: Open returned %d", opened);
+
+    std::vector<ArchiveFileInfo> files;
+    bool isEncrypted = false;
+    Gdiplus::Bitmap* thumbnail = nullptr;
+
+    if (opened) {
+        files = reader.ListFiles();
+        isEncrypted = reader.IsEncrypted();
+
+        // Extract thumbnail of first image file synchronously in this thread
+        std::string firstImageInternalPath;
+        for (const auto& file : files) {
+            if (!file.isDirectory && IsImageFile(file.name)) {
+                firstImageInternalPath = file.internalPath;
+                break;
+            }
+        }
+        if (!firstImageInternalPath.empty()) {
+            std::vector<char> buffer;
+            if (reader.ExtractFileToMemory(firstImageInternalPath, buffer)) {
+                thumbnail = LoadThumbnailFromMemory(buffer.data(), buffer.size(), 64, 64);
+            }
+        }
+        reader.Close();
+    }
+
+    EnterCriticalSection(&g_csArchives);
+    EnterCriticalSection(&g_csGridLoad);
+    bool sessionValid = (g_metadataSessionId == sessionId);
+    LeaveCriticalSection(&g_csGridLoad);
+
+    LogDebug("LoadMetadataThread: Finished. sessionValid=%d, files=%u", sessionValid, (unsigned int)files.size());
+
+    if (sessionValid && archiveIndex >= 0 && archiveIndex < (int)g_archives.size() && g_archives[archiveIndex].filePath == filePath) {
+        g_archives[archiveIndex].metadataLoaded = true;
+        if (!files.empty() || g_archives[archiveIndex].internalFiles.empty()) {
+            g_archives[archiveIndex].internalFiles = files;
+            g_archives[archiveIndex].isEncrypted = isEncrypted;
+            if (thumbnail) {
+                if (g_archives[archiveIndex].thumbnail) delete g_archives[archiveIndex].thumbnail;
+                g_archives[archiveIndex].thumbnail = thumbnail;
+            }
+        }
+        PostMessageW(hWnd, WM_USER_METADATA_LOADED, (WPARAM)archiveIndex, (LPARAM)sessionId);
+    } else {
+        if (thumbnail) delete thumbnail;
+    }
+    LeaveCriticalSection(&g_csArchives);
+
+    g_bPauseBackgroundScan = false;
     return 0;
 }
 
-// Struct for background thread parameters
 struct ScanThreadParams {
     HWND hWnd;
     std::wstring folderPath;
@@ -155,23 +257,69 @@ DWORD WINAPI ScanDirectoryThread(LPVOID lpParam) {
     std::vector<std::wstring> filePaths = params->filePaths;
     delete params;
 
-    for (size_t i = 0; i < filePaths.size(); ++i) {
+    std::vector<bool> processed(filePaths.size(), false);
+    size_t processedCount = 0;
+
+    while (processedCount < filePaths.size()) {
+        // If foreground grid loader is active, pause background scan to prioritize it
+        while (g_bPauseBackgroundScan) {
+            Sleep(150);
+            bool shouldExitPause = false;
+            EnterCriticalSection(&g_csArchives);
+            if (g_bCancelScan || g_currentFolder != folderPath) {
+                shouldExitPause = true;
+            }
+            LeaveCriticalSection(&g_csArchives);
+            if (shouldExitPause) break;
+        }
+
+        // Determine which index to scan next
+        int idx = -1;
+        EnterCriticalSection(&g_csArchives);
+        if (g_bCancelScan || g_currentFolder != folderPath) {
+            // will exit below
+        } else {
+            // Try priority index first
+            if (g_priorityIndex >= 0 && g_priorityIndex < (int)filePaths.size() && !processed[g_priorityIndex]) {
+                idx = g_priorityIndex;
+            } else {
+                // Otherwise find the first unprocessed index
+                for (size_t k = 0; k < filePaths.size(); ++k) {
+                    if (!processed[k]) {
+                        idx = (int)k;
+                        break;
+                    }
+                }
+            }
+        }
+        LeaveCriticalSection(&g_csArchives);
+
+        if (idx == -1) {
+            // Either cancelled or all processed
+            break;
+        }
+
+        // Mark as processed
+        processed[idx] = true;
+        processedCount++;
+
         // Stop scanning if cancelled, folder has changed, or app is closing
         bool shouldExit = false;
         bool shouldSkip = false;
         EnterCriticalSection(&g_csArchives);
         if (g_bCancelScan || g_currentFolder != folderPath) {
             shouldExit = true;
-        } else if (i < g_archives.size() && !g_archives[i].internalFiles.empty()) {
+        } else if (idx < (int)g_archives.size() && g_archives[idx].metadataLoaded) {
             shouldSkip = true;
         }
         LeaveCriticalSection(&g_csArchives);
         if (shouldExit) break;
         if (shouldSkip) continue;
 
-        std::wstring filePath = filePaths[i];
+        std::wstring filePath = filePaths[idx];
         
         ArchiveReader reader;
+        reader.SetCancelFlag(&g_bCancelScan);
         bool isEncrypted = false;
         bool opened = false;
 
@@ -203,11 +351,7 @@ DWORD WINAPI ScanDirectoryThread(LPVOID lpParam) {
             if (!firstImageInternalPath.empty()) {
                 std::vector<char> buffer;
                 if (reader.ExtractFileToMemory(firstImageInternalPath, buffer)) {
-                    Bitmap* pOrig = LoadImageFromMemory(buffer.data(), buffer.size());
-                    if (pOrig) {
-                        thumbnail = CreateThumbnail(pOrig, 64, 64);
-                        delete pOrig;
-                    }
+                    thumbnail = LoadThumbnailFromMemory(buffer.data(), buffer.size(), 64, 64);
                 }
             }
             reader.Close();
@@ -240,11 +384,7 @@ DWORD WINAPI ScanDirectoryThread(LPVOID lpParam) {
                     if (!firstImageInternalPath.empty()) {
                         std::vector<char> buffer;
                         if (reader.ExtractFileToMemory(firstImageInternalPath, buffer)) {
-                            Bitmap* pOrig = LoadImageFromMemory(buffer.data(), buffer.size());
-                            if (pOrig) {
-                                thumbnail = CreateThumbnail(pOrig, 64, 64);
-                                delete pOrig;
-                            }
+                            thumbnail = LoadThumbnailFromMemory(buffer.data(), buffer.size(), 64, 64);
                         }
                     }
                     reader.Close();
@@ -255,14 +395,17 @@ DWORD WINAPI ScanDirectoryThread(LPVOID lpParam) {
 
         // Save scanned details safely
         EnterCriticalSection(&g_csArchives);
-        if (!g_bCancelScan && g_currentFolder == folderPath && i < g_archives.size()) {
-            g_archives[i].isEncrypted = isEncrypted;
-            g_archives[i].internalFiles = internalFiles;
-            g_archives[i].thumbnail = thumbnail;
-            g_archives[i].currentPassword = matchedPwd;
+        if (!g_bCancelScan && g_currentFolder == folderPath && idx < (int)g_archives.size()) {
+            g_archives[idx].isEncrypted = isEncrypted;
+            g_archives[idx].internalFiles = internalFiles;
+            g_archives[idx].thumbnail = thumbnail;
+            g_archives[idx].currentPassword = matchedPwd;
+            if (!isEncrypted || !internalFiles.empty()) {
+                g_archives[idx].metadataLoaded = true;
+            }
             
             // Send message to main window to redraw listbox item
-            PostMessageW(hWnd, WM_USER_SCAN_ITEM, (WPARAM)i, 0);
+            PostMessageW(hWnd, WM_USER_SCAN_ITEM, (WPARAM)idx, 0);
         } else {
             if (thumbnail) delete thumbnail;
         }
@@ -276,13 +419,13 @@ DWORD WINAPI ScanDirectoryThread(LPVOID lpParam) {
 std::wstring GetAppTempRoot() {
     wchar_t* userProfile = _wgetenv(L"USERPROFILE");
     if (userProfile) {
-        std::wstring customPath = std::wstring(userProfile) + L"\\Pictures\\ArchivePreviewerTemp";
+        std::wstring customPath = std::wstring(userProfile) + L"\\Pictures\\ArchivePreviewer";
         fs::create_directories(customPath);
         return customPath;
     }
     wchar_t tempPath[MAX_PATH];
     GetTempPathW(MAX_PATH, tempPath);
-    std::wstring customPath = std::wstring(tempPath) + L"ArchivePreviewerTemp";
+    std::wstring customPath = std::wstring(tempPath) + L"ArchivePreviewer";
     fs::create_directories(customPath);
     return customPath;
 }
@@ -305,16 +448,7 @@ void CleanupTempDirectories() {
         CloseHandle(hLoadThread);
     }
 
-    EnterCriticalSection(&g_csTempExtract);
-    g_bCancelExtract = true;
-    HANDLE hThread = g_hExtractThread;
-    g_hExtractThread = NULL;
-    LeaveCriticalSection(&g_csTempExtract);
 
-    if (hThread) {
-        WaitForSingleObject(hThread, INFINITE);
-        CloseHandle(hThread);
-    }
 
     EnterCriticalSection(&g_csTempExtract);
     for (const auto& dir : g_tempDirsCreated) {
@@ -450,9 +584,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     return (int)msg.wParam;
 }
 
+DWORD GetRegDword(HKEY hKeyParent, const std::wstring& subKey, const std::wstring& valueName, DWORD defaultValue) {
+    HKEY hKey;
+    DWORD value = defaultValue;
+    if (RegOpenKeyExW(hKeyParent, subKey.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD size = sizeof(DWORD);
+        RegQueryValueExW(hKey, valueName.c_str(), NULL, NULL, (BYTE*)&value, &size);
+        RegCloseKey(hKey);
+    }
+    return value;
+}
+
+void SetRegDword(HKEY hKeyParent, const std::wstring& subKey, const std::wstring& valueName, DWORD value) {
+    HKEY hKey;
+    if (RegCreateKeyExW(hKeyParent, subKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(hKey, valueName.c_str(), 0, REG_DWORD, (const BYTE*)&value, sizeof(DWORD));
+        RegCloseKey(hKey);
+    }
+}
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         case WM_CREATE: {
+            g_hMainWnd = hWnd;
             g_hPathEdit = CreateWindowExW(0, L"EDIT", L"", 
                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_READONLY,
                 10, 10, 400, 25, hWnd, (HMENU)IDC_PATH_EDIT, NULL, NULL);
@@ -461,7 +615,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                 420, 10, 100, 25, hWnd, (HMENU)IDC_BROWSE_BTN, NULL, NULL);
 
-            g_hViewToggleBtn = CreateWindowExW(0, L"BUTTON", L"Grid View", 
+            // Load view mode from registry (0 = List View, 1 = Grid View)
+            DWORD savedViewMode = GetRegDword(HKEY_CURRENT_USER, L"SOFTWARE\\ArchivePreviewer", L"GridViewMode", 0);
+            g_bGridView = (savedViewMode != 0);
+
+            g_hViewToggleBtn = CreateWindowExW(0, L"BUTTON", g_bGridView ? L"List View" : L"Grid View", 
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                 530, 10, 100, 25, hWnd, (HMENU)IDC_VIEW_TOGGLE_BTN, NULL, NULL);
 
@@ -474,16 +632,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                 750, 10, 150, 25, hWnd, (HMENU)IDC_EXTRACT_BTN, NULL, NULL);
 
             g_hArchiveList = CreateWindowExW(0, L"LISTBOX", NULL,
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_OWNERDRAWFIXED | LBS_NOTIFY | WS_BORDER,
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_OWNERDRAWFIXED | LBS_NOTIFY | WS_BORDER | LBS_NOINTEGRALHEIGHT,
                 10, 45, 340, 500, hWnd, (HMENU)IDC_ARCHIVE_LIST, NULL, NULL);
             SendMessage(g_hArchiveList, LB_SETITEMHEIGHT, 0, 80);
 
             g_hContentsList = CreateWindowExW(0, L"LISTBOX", NULL,
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | LBS_NOTIFY,
+                WS_CHILD | (g_bGridView ? 0 : WS_VISIBLE) | WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
                 360, 45, 510, 500, hWnd, (HMENU)IDC_CONTENTS_LIST, NULL, NULL);
 
             g_hGridViewWnd = CreateWindowExW(0, L"ArchiveGridViewClass", NULL,
-                WS_CHILD | WS_VSCROLL | WS_BORDER,
+                WS_CHILD | (g_bGridView ? WS_VISIBLE : 0) | WS_VSCROLL | WS_BORDER,
                 360, 45, 510, 500, hWnd, (HMENU)IDC_GRID_VIEW_WND, NULL, NULL);
 
             HFONT hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
@@ -543,10 +701,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             int rightX = g_splitPos + 10;
             int rightWidth = width - g_splitPos - 20;
 
-            MoveWindow(g_hArchiveList, 10, 45, leftWidth, height - 60, TRUE);
-            MoveWindow(g_hContentsList, rightX, 45, rightWidth, height - 60, TRUE);
+            MoveWindow(g_hArchiveList, 10, 45, leftWidth, height - 55, TRUE);
+            MoveWindow(g_hContentsList, rightX, 45, rightWidth, height - 55, TRUE);
             if (g_hGridViewWnd) {
-                MoveWindow(g_hGridViewWnd, rightX, 45, rightWidth, height - 60, TRUE);
+                MoveWindow(g_hGridViewWnd, rightX, 45, rightWidth, height - 55, TRUE);
             }
             break;
         }
@@ -845,6 +1003,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             }
             else if (wmId == IDC_VIEW_TOGGLE_BTN && wmEvent == BN_CLICKED) {
                 g_bGridView = !g_bGridView;
+                SetRegDword(HKEY_CURRENT_USER, L"SOFTWARE\\ArchivePreviewer", L"GridViewMode", g_bGridView ? 1 : 0);
                 if (g_bGridView) {
                     SetWindowTextW(g_hViewToggleBtn, L"List View");
                     ShowWindow(g_hContentsList, SW_HIDE);
@@ -866,6 +1025,77 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         case WM_DESTROY: {
             PostQuitMessage(0);
             break;
+        }
+
+        case WM_USER_METADATA_LOADED: {
+            int archiveIndex = (int)wParam;
+            int sessionId = (int)lParam;
+            
+            EnterCriticalSection(&g_csGridLoad);
+            bool sessionValid = (g_metadataSessionId == sessionId);
+            LeaveCriticalSection(&g_csGridLoad);
+            
+            LogDebug("WndProc: WM_USER_METADATA_LOADED for index %d, session %d, valid=%d", archiveIndex, sessionId, sessionValid);
+            
+            if (sessionValid) {
+                if (g_hArchiveList) {
+                    RECT rcItem;
+                    SendMessageW(g_hArchiveList, LB_GETITEMRECT, archiveIndex, (LPARAM)&rcItem);
+                    InvalidateRect(g_hArchiveList, &rcItem, TRUE);
+                }
+                
+                int curSel = (int)SendMessageW(g_hArchiveList, LB_GETCURSEL, 0, 0);
+                LogDebug("WndProc: curSel = %d", curSel);
+                if (curSel == archiveIndex) {
+                    UpdateContentsList(archiveIndex);
+                }
+            }
+            return 0;
+        }
+
+        case WM_USER_NEED_PASSWORD: {
+            int archiveIndex = (int)wParam;
+            int sessionId = (int)lParam;
+            
+            EnterCriticalSection(&g_csGridLoad);
+            bool sessionValid = (g_metadataSessionId == sessionId);
+            LeaveCriticalSection(&g_csGridLoad);
+            
+            if (!sessionValid) return 0;
+            
+            std::wstring filePath;
+            EnterCriticalSection(&g_csArchives);
+            if (archiveIndex >= 0 && archiveIndex < (int)g_archives.size()) {
+                filePath = g_archives[archiveIndex].filePath;
+            }
+            LeaveCriticalSection(&g_csArchives);
+            
+            if (!filePath.empty()) {
+                ArchiveReader reader;
+                std::wstring enteredPwd;
+                if (OpenArchiveWithPasswordSupport(reader, filePath, hWnd, enteredPwd)) {
+                    auto files = reader.ListFiles();
+                    reader.Close();
+                    
+                    EnterCriticalSection(&g_csArchives);
+                    if (archiveIndex < (int)g_archives.size() && g_archives[archiveIndex].filePath == filePath) {
+                        g_archives[archiveIndex].internalFiles = files;
+                        g_archives[archiveIndex].currentPassword = enteredPwd;
+                        g_archives[archiveIndex].isEncrypted = true;
+                        g_archives[archiveIndex].metadataLoaded = true;
+                    }
+                    LeaveCriticalSection(&g_csArchives);
+                    
+                    PostMessageW(hWnd, WM_USER_METADATA_LOADED, (WPARAM)archiveIndex, (LPARAM)sessionId);
+                } else {
+                    int curSel = (int)SendMessageW(g_hArchiveList, LB_GETCURSEL, 0, 0);
+                    if (curSel == archiveIndex) {
+                        SendMessageW(g_hContentsList, LB_RESETCONTENT, 0, 0);
+                        SendMessageW(g_hContentsList, LB_ADDSTRING, 0, (LPARAM)L"[Dibatalkan atau memerlukan sandi]");
+                    }
+                }
+            }
+            return 0;
         }
 
         default:
@@ -911,7 +1141,8 @@ bool IsImageFile(const std::wstring& filename) {
     return ext == L".png" || ext == L".jpg" || ext == L".jpeg" || ext == L".bmp" || ext == L".gif";
 }
 
-Bitmap* LoadImageFromMemory(const char* data, size_t size) {
+Bitmap* LoadThumbnailFromMemory(const char* data, size_t size, int thumbWidth, int thumbHeight) {
+    if (size == 0) return nullptr;
     HGLOBAL hBuffer = GlobalAlloc(GMEM_MOVEABLE, size);
     if (!hBuffer) return nullptr;
 
@@ -929,15 +1160,16 @@ Bitmap* LoadImageFromMemory(const char* data, size_t size) {
         return nullptr;
     }
 
-    Bitmap* pBitmap = Bitmap::FromStream(pStream);
-    pStream->Release();
-    
-    if (pBitmap && pBitmap->GetLastStatus() == Ok) {
-        return pBitmap;
+    Bitmap* pOrig = Bitmap::FromStream(pStream);
+    Bitmap* pThumb = nullptr;
+    if (pOrig) {
+        if (pOrig->GetLastStatus() == Ok) {
+            pThumb = CreateThumbnail(pOrig, thumbWidth, thumbHeight);
+        }
+        delete pOrig;
     }
-    
-    delete pBitmap;
-    return nullptr;
+    pStream->Release(); // Releases stream and frees hBuffer
+    return pThumb;
 }
 
 Bitmap* CreateThumbnail(Bitmap* pSource, int thumbWidth, int thumbHeight) {
@@ -1023,6 +1255,8 @@ void ScanDirectory(HWND hWnd, const std::wstring& folderPath) {
                     item.fileName = entry.path().filename().wstring();
                     item.thumbnail = nullptr;
                     item.isEncrypted = false;
+                    item.metadataLoaded = false;
+                    item.extractionFinished = false;
 
                     g_archives.push_back(item);
                     filePathsToScan.push_back(item.filePath);
@@ -1045,7 +1279,9 @@ void ScanDirectory(HWND hWnd, const std::wstring& folderPath) {
         params->filePaths = filePathsToScan;
         
         g_hScanThread = CreateThread(NULL, 0, ScanDirectoryThread, params, 0, NULL);
-        if (!g_hScanThread) {
+        if (g_hScanThread) {
+            SetThreadPriority(g_hScanThread, THREAD_PRIORITY_BELOW_NORMAL);
+        } else {
             delete params;
         }
     }
@@ -1053,209 +1289,94 @@ void ScanDirectory(HWND hWnd, const std::wstring& folderPath) {
     LeaveCriticalSection(&g_csArchives);
 }
 
+
+
 void UpdateContentsList(int archiveIndex) {
     if (!g_hContentsList) return;
-    SendMessage(g_hContentsList, LB_RESETCONTENT, 0, 0);
 
     EnterCriticalSection(&g_csArchives);
+    g_priorityIndex = archiveIndex;
     if (archiveIndex < 0 || archiveIndex >= (int)g_archives.size()) {
+        SendMessage(g_hContentsList, LB_RESETCONTENT, 0, 0);
         LeaveCriticalSection(&g_csArchives);
         return;
     }
 
     auto& archive = g_archives[archiveIndex];
-    
-    // If archive is not yet loaded/scanned (internalFiles is empty)
-    if (archive.internalFiles.empty()) {
-        std::wstring filePath = archive.filePath;
-        LeaveCriticalSection(&g_csArchives); // Release critical section to avoid deadlocks
-
-        ArchiveReader reader;
-        bool opened = false;
-        std::wstring enteredPwd;
-
-        if (reader.Open(filePath)) {
-            opened = true;
-        } else if (reader.IsEncrypted()) {
-            if (OpenArchiveWithPasswordSupport(reader, filePath, g_hMainWnd, enteredPwd)) {
-                opened = true;
-            }
-        }
-
-        if (opened) {
-            std::vector<ArchiveFileInfo> files = reader.ListFiles();
-            bool isEncrypted = reader.IsEncrypted();
-            
-            // Extract thumbnail
-            Gdiplus::Bitmap* thumbnail = nullptr;
-            std::string firstImageInternalPath;
-            for (const auto& file : files) {
-                if (!file.isDirectory && IsImageFile(file.name)) {
-                    firstImageInternalPath = file.internalPath;
-                    break;
-                }
-            }
-            if (!firstImageInternalPath.empty()) {
-                std::vector<char> buffer;
-                if (reader.ExtractFileToMemory(firstImageInternalPath, buffer)) {
-                    Bitmap* pOrig = LoadImageFromMemory(buffer.data(), buffer.size());
-                    if (pOrig) {
-                        thumbnail = CreateThumbnail(pOrig, 64, 64);
-                        delete pOrig;
-                    }
-                }
-            }
-            reader.Close();
-            
-            EnterCriticalSection(&g_csArchives);
-            // Verify path is still valid
-            if (archiveIndex < (int)g_archives.size() && g_archives[archiveIndex].filePath == filePath) {
-                g_archives[archiveIndex].isEncrypted = isEncrypted;
-                g_archives[archiveIndex].currentPassword = enteredPwd;
-                g_archives[archiveIndex].internalFiles = files;
-                if (thumbnail) {
-                    if (g_archives[archiveIndex].thumbnail) delete g_archives[archiveIndex].thumbnail;
-                    g_archives[archiveIndex].thumbnail = thumbnail;
-                }
-                
-                // Force redraw the listbox item
-                RECT rect;
-                SendMessage(g_hArchiveList, LB_GETITEMRECT, archiveIndex, (LPARAM)&rect);
-                InvalidateRect(g_hArchiveList, &rect, TRUE);
-            } else {
-                if (thumbnail) delete thumbnail;
-            }
-        } else {
-            EnterCriticalSection(&g_csArchives);
-            SendMessage(g_hArchiveList, LB_SETCURSEL, (WPARAM)-1, 0);
-            LeaveCriticalSection(&g_csArchives);
-            return;
-        }
-    }
-
-    // Trigger background pre-extraction if not already started
     std::wstring filePath = archive.filePath;
     std::wstring password = archive.currentPassword;
-    std::wstring tempDirToCreate = L"";
-    bool needStartExtraction = false;
-
-    EnterCriticalSection(&g_csTempExtract);
-    if (archive.tempExtractDir.empty()) {
-        needStartExtraction = true;
-        std::wstring tempRoot = GetAppTempRoot();
-        std::wstring stemName = fs::path(filePath).stem().wstring();
-        for (auto& ch : stemName) {
-            if (ch == L' ' || ch == L'.' || ch == L',' || ch == L'[' || ch == L']' || ch == L'(' || ch == L')') {
-                ch = L'_';
-            }
-        }
-        tempDirToCreate = tempRoot + L"\\AP_Ext_" + std::to_wstring(GetTickCount64()) + L"_" + stemName;
-    }
-    LeaveCriticalSection(&g_csTempExtract);
-
-    if (needStartExtraction) {
-        // Create the directory
-        fs::create_directories(tempDirToCreate);
-
-        // Update the archive item under g_csArchives
-        archive.tempExtractDir = tempDirToCreate;
-        archive.extractionFinished = false;
-
-        // Cancel previous extraction thread. We release g_csArchives before waiting to avoid deadlocks!
-        LeaveCriticalSection(&g_csArchives);
-
-        EnterCriticalSection(&g_csTempExtract);
-        g_tempDirsCreated.push_back(tempDirToCreate);
-        g_bCancelExtract = true;
-        HANDLE hPrev = g_hExtractThread;
-        g_hExtractThread = NULL;
-        g_currentArchiveExtracting.clear();
-        LeaveCriticalSection(&g_csTempExtract);
-
-        if (hPrev) {
-            WaitForSingleObject(hPrev, INFINITE);
-            CloseHandle(hPrev);
-        }
-
-        EnterCriticalSection(&g_csTempExtract);
-        g_bCancelExtract = false;
-        g_currentArchiveExtracting = filePath;
-
-        ExtractThreadParams* extParams = new ExtractThreadParams();
-        extParams->archivePath = filePath;
-        extParams->password = password;
-        extParams->tempDir = tempDirToCreate;
-        extParams->archiveIndex = archiveIndex;
-
-        g_hExtractThread = CreateThread(NULL, 0, ExtractArchiveThread, extParams, 0, NULL);
-        if (!g_hExtractThread) {
-            delete extParams;
-            g_currentArchiveExtracting.clear();
-        }
-        LeaveCriticalSection(&g_csTempExtract);
-
-        // Re-enter g_csArchives
-        EnterCriticalSection(&g_csArchives);
+    
+    // If archive is not yet loaded/scanned (metadataLoaded is false)
+    if (!archive.metadataLoaded) {
+        // Clear UI and show loading status immediately to keep UI active and responsive
+        SendMessageW(g_hContentsList, LB_RESETCONTENT, 0, 0);
+        SendMessageW(g_hContentsList, LB_ADDSTRING, 0, (LPARAM)L"Membuka arsip...");
         
-        // Need to re-bind archive reference after releasing/re-entering critical section
-        if (archiveIndex < 0 || archiveIndex >= (int)g_archives.size() || g_archives[archiveIndex].filePath != filePath) {
-            LeaveCriticalSection(&g_csArchives);
-            return;
+        // Clear active grid items
+        EnterCriticalSection(&g_csGridItems);
+        for (auto& item : g_gridItems) {
+            if (item.pBitmap) delete item.pBitmap;
         }
+        g_gridItems.clear();
+        LeaveCriticalSection(&g_csGridItems);
+        if (g_hGridViewWnd) InvalidateRect(g_hGridViewWnd, NULL, TRUE);
+
+        // Cancel any pending metadata load threads by incrementing session ID
+        EnterCriticalSection(&g_csGridLoad);
+        g_metadataSessionId++;
+        int currentSession = g_metadataSessionId;
+        LeaveCriticalSection(&g_csGridLoad);
+
+        LoadMetadataParams* metadataParams = new LoadMetadataParams();
+        metadataParams->hWnd = g_hMainWnd;
+        metadataParams->archiveIndex = archiveIndex;
+        metadataParams->filePath = filePath;
+        metadataParams->sessionId = currentSession;
+        
+        HANDLE hThread = CreateThread(NULL, 0, LoadMetadataThread, metadataParams, 0, NULL);
+        if (hThread) {
+            SetThreadPriority(hThread, THREAD_PRIORITY_ABOVE_NORMAL);
+            CloseHandle(hThread);
+        } else {
+            delete metadataParams;
+        }
+
+        LeaveCriticalSection(&g_csArchives);
+        return;
     }
 
-    void UpdateGridItems(const std::vector<ArchiveFileInfo>& files, const std::wstring& tempDir);
-    UpdateGridItems(archive.internalFiles, archive.tempExtractDir);
+    // Populate contents if already loaded
+    SendMessageW(g_hContentsList, LB_RESETCONTENT, 0, 0);
+    UpdateGridItems(archive.internalFiles, filePath, password);
 
-    for (const auto& file : archive.internalFiles) {
-        std::wstring itemText = file.name;
-        if (file.isDirectory) {
-            itemText += L"  [Directory]";
-        } else {
-            wchar_t sizeStr[64];
-            swprintf_s(sizeStr, L"  (%u KB)", (unsigned int)(file.fileSize / 1024));
-            itemText += sizeStr;
+    if (archive.internalFiles.empty()) {
+        SendMessageW(g_hContentsList, LB_ADDSTRING, 0, (LPARAM)L"[Tidak ada file atau gagal memuat arsip]");
+    } else {
+        for (const auto& file : archive.internalFiles) {
+            std::wstring displayName = fs::path(file.name).filename().wstring();
+            std::wstring itemText = displayName;
+            if (file.isDirectory) {
+                itemText += L"  [Directory]";
+            } else {
+                wchar_t sizeStr[64];
+                swprintf_s(sizeStr, L"  (%u KB)", (unsigned int)(file.fileSize / 1024));
+                itemText += sizeStr;
+            }
+            SendMessageW(g_hContentsList, LB_ADDSTRING, 0, (LPARAM)itemText.c_str());
         }
-        SendMessageW(g_hContentsList, LB_ADDSTRING, 0, (LPARAM)itemText.c_str());
     }
     LeaveCriticalSection(&g_csArchives);
 }
 
-bool WaitForExtraction(int archiveIndex, HWND hwndParent) {
-    EnterCriticalSection(&g_csArchives);
-    if (archiveIndex < 0 || archiveIndex >= (int)g_archives.size()) {
-        LeaveCriticalSection(&g_csArchives);
-        return false;
-    }
-    bool finished = g_archives[archiveIndex].extractionFinished;
-    LeaveCriticalSection(&g_csArchives);
-
-    if (finished) return true;
-
-    HCURSOR hOldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
-    
-    DWORD start = GetTickCount();
-    while (GetTickCount() - start < 5000) {
-        EnterCriticalSection(&g_csArchives);
-        finished = g_archives[archiveIndex].extractionFinished;
-        LeaveCriticalSection(&g_csArchives);
-
-        if (finished) break;
-
-        MSG msg;
-        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-        Sleep(50);
-    }
-    SetCursor(hOldCursor);
-    return finished;
+// Opens a file using its default associated app (e.g. Photos for images).
+// Since all images are flat-extracted to the same folder, Photos can see
+// sibling files and enable Next/Prev navigation.
+bool OpenFileWithDefaultApp(const std::wstring& filePath) {
+    HINSTANCE result = ShellExecuteW(NULL, NULL, filePath.c_str(), NULL, NULL, SW_SHOWNORMAL);
+    return (INT_PTR)result > 32;
 }
 
 void OpenArchiveFile(int archiveIndex, int fileIndex) {
-    WaitForExtraction(archiveIndex, g_hMainWnd);
-
     EnterCriticalSection(&g_csArchives);
     if (archiveIndex < 0 || archiveIndex >= (int)g_archives.size()) {
         LeaveCriticalSection(&g_csArchives);
@@ -1279,35 +1400,16 @@ void OpenArchiveFile(int archiveIndex, int fileIndex) {
     std::wstring tempExtractDir = archive.tempExtractDir;
     LeaveCriticalSection(&g_csArchives);
 
-    // 1. Check if the file is ready in the pre-extracted temp directory
-    std::wstring preExtPath = tempExtractDir + L"\\" + fileName;
-    for (auto& ch : preExtPath) {
-        if (ch == L'/') ch = L'\\';
-    }
-
-    bool fileReady = false;
-    if (!tempExtractDir.empty()) {
-        for (int i = 0; i < 50; ++i) { // Wait up to 5 seconds
-            if (fs::exists(preExtPath)) {
-                std::error_code ec;
-                auto sz = fs::file_size(preExtPath, ec);
-                if (!ec && sz > 0) {
-                    fileReady = true;
-                    break;
-                }
-            }
-            Sleep(100);
-        }
-    }
-
-    if (fileReady) {
-        ShellExecuteW(NULL, L"open", preExtPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
-        return;
-    }
-
-    // 2. Fallback: Extract file singly to temp folder (same as before)
+    // Extract file singly to temp folder
     std::wstring appTempDir = GetAppTempRoot() + L"\\SingleExtract";
     fs::create_directories(appTempDir);
+    
+    EnterCriticalSection(&g_csTempExtract);
+    if (std::find(g_tempDirsCreated.begin(), g_tempDirsCreated.end(), appTempDir) == g_tempDirsCreated.end()) {
+        g_tempDirsCreated.push_back(appTempDir);
+    }
+    LeaveCriticalSection(&g_csTempExtract);
+
     std::wstring destPath = appTempDir + L"\\" + fs::path(fileName).filename().wstring();
 
     ArchiveReader reader;
@@ -1315,7 +1417,7 @@ void OpenArchiveFile(int archiveIndex, int fileIndex) {
         bool success = reader.ExtractFileToDisk(internalPath, destPath);
         reader.Close();
         if (success) {
-            ShellExecuteW(NULL, L"open", destPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
+            OpenFileWithDefaultApp(destPath);
         } else {
             MessageBoxW(NULL, L"Failed to extract file for viewing.", L"Error", MB_ICONERROR | MB_OK);
         }
@@ -1851,124 +1953,179 @@ bool OpenArchiveWithPasswordSupport(ArchiveReader& reader, const std::wstring& a
     }
 }
 
-CRITICAL_SECTION g_csGridItems;
-struct GridItemCache {
-    std::wstring name;
-    std::wstring fullDiskPath;
-    Gdiplus::Bitmap* pBitmap;
-    bool loadAttempted;
-};
-std::vector<GridItemCache> g_gridItems;
+// (GridItemCache, g_csGridItems, g_gridItems defined at top of file)
 int g_selectedGridIndex = -1;
 int g_hoverGridIndex = -1;
 int g_gridScrollPos = 0;
 
 struct GridLoadThreadParams {
-    std::wstring tempDir;
+    std::wstring archivePath;
+    std::wstring password;
+    int sessionId;
 };
 
 // Background thumbnail loader thread function
 DWORD WINAPI GridThumbnailLoaderThread(LPVOID lpParam) {
     GridLoadThreadParams* params = (GridLoadThreadParams*)lpParam;
-    std::wstring tempDir = params->tempDir;
+    std::wstring archivePath = params->archivePath;
+    std::wstring password = params->password;
+    int sessionId = params->sessionId;
     delete params;
 
+    // Pause background scanner to allocate all resources to active grid thumbnail loading
+    g_bPauseBackgroundScan = true;
+
+    ArchiveReader reader;
+    bool readerOpened = false;
+
     while (true) {
+        // Quick session check
         EnterCriticalSection(&g_csGridLoad);
-        bool cancel = g_bCancelGridLoad;
+        bool cancel = g_bCancelGridLoad || (g_gridLoadSessionId != sessionId);
         LeaveCriticalSection(&g_csGridLoad);
 
         if (cancel) break;
 
-        // Find next item to load
+        // Find next item to load, prioritizing visible ones in the viewport first
         EnterCriticalSection(&g_csGridItems);
         size_t total = g_gridItems.size();
         GridItemCache* pItem = nullptr;
         int itemIndex = -1;
-        
+
+        int wndHeight = 0;
+        int wndWidth = 0;
+        if (g_hGridViewWnd) {
+            RECT rect;
+            GetClientRect(g_hGridViewWnd, &rect);
+            wndHeight = rect.bottom;
+            wndWidth = rect.right;
+        }
+        int cols = 1;
+        if (wndWidth > 0) {
+            int cardWidth = 120;
+            int margin = 15;
+            cols = (wndWidth - margin) / (cardWidth + margin);
+            if (cols < 1) cols = 1;
+        }
+
+        // 1. Try to find the first visible, un-attempted item
         for (size_t i = 0; i < total; ++i) {
             if (!g_gridItems[i].pBitmap && !g_gridItems[i].loadAttempted) {
-                pItem = &g_gridItems[i];
-                itemIndex = (int)i;
-                break;
+                int row = (int)i / cols;
+                int itemY = 15 + row * (140 + 15) - g_gridScrollPos;
+                if (itemY + 140 >= 0 && itemY <= wndHeight) {
+                    pItem = &g_gridItems[i];
+                    itemIndex = (int)i;
+                    break;
+                }
+            }
+        }
+
+        // 2. If no visible items need loading, fall back to sequential from the start
+        if (!pItem) {
+            for (size_t i = 0; i < total; ++i) {
+                if (!g_gridItems[i].pBitmap && !g_gridItems[i].loadAttempted) {
+                    pItem = &g_gridItems[i];
+                    itemIndex = (int)i;
+                    break;
+                }
             }
         }
         LeaveCriticalSection(&g_csGridItems);
 
         if (!pItem) {
-            Sleep(100);
-            
-            bool extractionFinished = false;
-            int archiveIndex = (int)SendMessageW(g_hArchiveList, LB_GETCURSEL, 0, 0);
-            if (archiveIndex >= 0) {
-                EnterCriticalSection(&g_csArchives);
-                extractionFinished = g_archives[archiveIndex].extractionFinished;
-                LeaveCriticalSection(&g_csArchives);
-            }
-            
-            EnterCriticalSection(&g_csGridItems);
-            bool allAttempted = true;
-            for (const auto& item : g_gridItems) {
-                if (!item.pBitmap && !item.loadAttempted) {
-                    allAttempted = false;
-                    break;
+            break; // No more items to load
+        }
+
+        // We have an item to load! Get the internal path and name
+        std::string internalPath = pItem->internalPath;
+        std::wstring name = pItem->name;
+
+        // Open reader if not already opened
+        if (!readerOpened) {
+            if (reader.Open(archivePath, password)) {
+                readerOpened = true;
+            } else {
+                // If we can't open the archive, fail all remaining items (if session is still valid)
+                EnterCriticalSection(&g_csGridLoad);
+                bool sessionValid = (g_gridLoadSessionId == sessionId);
+                LeaveCriticalSection(&g_csGridLoad);
+                if (sessionValid) {
+                    EnterCriticalSection(&g_csGridItems);
+                    for (auto& item : g_gridItems) {
+                        item.loadAttempted = true;
+                    }
+                    LeaveCriticalSection(&g_csGridItems);
                 }
-            }
-            LeaveCriticalSection(&g_csGridItems);
-            
-            if (extractionFinished && allAttempted) {
                 break;
             }
-            continue;
         }
 
-        if (fs::exists(pItem->fullDiskPath)) {
-            std::error_code ec;
-            auto sz = fs::file_size(pItem->fullDiskPath, ec);
-            if (!ec && sz > 0) {
-                Gdiplus::Bitmap* pOrig = Gdiplus::Bitmap::FromFile(pItem->fullDiskPath.c_str());
-                Gdiplus::Bitmap* pThumb = nullptr;
-                if (pOrig && pOrig->GetLastStatus() == Gdiplus::Ok) {
-                    pThumb = CreateThumbnail(pOrig, 100, 100);
-                    delete pOrig;
-                } else {
-                    if (pOrig) delete pOrig;
-                }
+        // Check cancellation again before slow extraction
+        EnterCriticalSection(&g_csGridLoad);
+        cancel = g_bCancelGridLoad || (g_gridLoadSessionId != sessionId);
+        LeaveCriticalSection(&g_csGridLoad);
+        if (cancel) break;
 
-                EnterCriticalSection(&g_csGridItems);
-                if (itemIndex < (int)g_gridItems.size() && g_gridItems[itemIndex].name == pItem->name) {
-                    if (pThumb) {
-                        g_gridItems[itemIndex].pBitmap = pThumb;
-                    } else {
-                        g_gridItems[itemIndex].loadAttempted = true;
-                    }
-                } else {
-                    if (pThumb) delete pThumb;
-                }
-                LeaveCriticalSection(&g_csGridItems);
+        std::vector<char> buffer;
+        Gdiplus::Bitmap* pThumb = nullptr;
+        if (reader.ExtractFileToMemory(internalPath, buffer)) {
+            pThumb = LoadThumbnailFromMemory(buffer.data(), buffer.size(), 100, 100);
+        }
 
-                if (g_hGridViewWnd) {
-                    InvalidateRect(g_hGridViewWnd, NULL, FALSE);
+        // Check session validity again before writing back to globals
+        EnterCriticalSection(&g_csGridLoad);
+        bool sessionValid = (g_gridLoadSessionId == sessionId);
+        LeaveCriticalSection(&g_csGridLoad);
+
+        if (sessionValid) {
+            EnterCriticalSection(&g_csGridItems);
+            // Verify the item at itemIndex is still the same one (in case grid items were cleared/updated)
+            if (itemIndex < (int)g_gridItems.size() && g_gridItems[itemIndex].name == name) {
+                if (pThumb) {
+                    g_gridItems[itemIndex].pBitmap = pThumb;
+                } else {
+                    g_gridItems[itemIndex].loadAttempted = true;
                 }
             } else {
-                Sleep(50);
+                if (pThumb) delete pThumb;
+            }
+            LeaveCriticalSection(&g_csGridItems);
+
+            if (g_hGridViewWnd) {
+                InvalidateRect(g_hGridViewWnd, NULL, FALSE);
             }
         } else {
-            Sleep(100);
+            if (pThumb) delete pThumb;
+            break; // Session changed, exit thread immediately
         }
     }
+
+    if (readerOpened) {
+        reader.Close();
+    }
+
+    // Resume background scanner if this session is still the active one
+    EnterCriticalSection(&g_csGridLoad);
+    if (g_gridLoadSessionId == sessionId) {
+        g_bPauseBackgroundScan = false;
+    }
+    LeaveCriticalSection(&g_csGridLoad);
+
     return 0;
 }
 
-void UpdateGridItems(const std::vector<ArchiveFileInfo>& files, const std::wstring& tempDir) {
+void UpdateGridItems(const std::vector<ArchiveFileInfo>& files, const std::wstring& archivePath, const std::wstring& password) {
     EnterCriticalSection(&g_csGridLoad);
     g_bCancelGridLoad = true;
+    g_gridLoadSessionId++; // Increment session ID so any running thread will ignore its results
+    int currentSession = g_gridLoadSessionId;
     HANDLE hPrevLoad = g_hGridLoadThread;
     g_hGridLoadThread = NULL;
     LeaveCriticalSection(&g_csGridLoad);
 
+    // We do NOT block on hPrevLoad! The thread will self-terminate safely.
     if (hPrevLoad) {
-        WaitForSingleObject(hPrevLoad, INFINITE);
         CloseHandle(hPrevLoad);
     }
 
@@ -1985,10 +2142,7 @@ void UpdateGridItems(const std::vector<ArchiveFileInfo>& files, const std::wstri
         if (!file.isDirectory && IsImageFile(file.name)) {
             GridItemCache item;
             item.name = file.name;
-            item.fullDiskPath = tempDir + L"\\" + file.name;
-            for (auto& ch : item.fullDiskPath) {
-                if (ch == L'/') ch = L'\\';
-            }
+            item.internalPath = file.internalPath;
             item.pBitmap = nullptr;
             item.loadAttempted = false;
             g_gridItems.push_back(item);
@@ -1999,7 +2153,9 @@ void UpdateGridItems(const std::vector<ArchiveFileInfo>& files, const std::wstri
     EnterCriticalSection(&g_csGridLoad);
     g_bCancelGridLoad = false;
     GridLoadThreadParams* pLoadParams = new GridLoadThreadParams();
-    pLoadParams->tempDir = tempDir;
+    pLoadParams->archivePath = archivePath;
+    pLoadParams->password = password;
+    pLoadParams->sessionId = currentSession;
     g_hGridLoadThread = CreateThread(NULL, 0, GridThumbnailLoaderThread, pLoadParams, 0, NULL);
     if (!g_hGridLoadThread) {
         delete pLoadParams;
@@ -2351,6 +2507,36 @@ LRESULT CALLBACK GridViewWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                     graphics.DrawString(label.c_str(), -1, &font, textRect, &strFormat, &textBrush);
                 }
             }
+            
+            if (totalItems == 0) {
+                Gdiplus::FontFamily fontFamily(L"Segoe UI");
+                Gdiplus::Font fontLarge(&fontFamily, 12, Gdiplus::FontStyleRegular, Gdiplus::UnitPoint);
+                Gdiplus::SolidBrush statusBrush(Gdiplus::Color(255, 140, 140, 150));
+                Gdiplus::RectF layoutRect(0.0f, 0.0f, (REAL)width, (REAL)height);
+                
+                int selectedIndex = -1;
+                if (g_hArchiveList) {
+                    selectedIndex = (int)SendMessageW(g_hArchiveList, LB_GETCURSEL, 0, 0);
+                }
+                
+                std::wstring statusMsg = L"Tidak ada arsip terpilih";
+                if (selectedIndex >= 0) {
+                    bool loaded = false;
+                    EnterCriticalSection(&g_csArchives);
+                    if (selectedIndex < (int)g_archives.size()) {
+                        loaded = g_archives[selectedIndex].metadataLoaded;
+                    }
+                    LeaveCriticalSection(&g_csArchives);
+                    
+                    if (!loaded) {
+                        statusMsg = L"Membuka arsip...";
+                    } else {
+                        statusMsg = L"Tidak ada file gambar di dalam arsip ini";
+                    }
+                }
+                graphics.DrawString(statusMsg.c_str(), -1, &fontLarge, layoutRect, &strFormat, &statusBrush);
+            }
+            
             LeaveCriticalSection(&g_csGridItems);
 
             BitBlt(hdc, 0, 0, width, height, hdcMem, 0, 0, SRCCOPY);
