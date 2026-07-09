@@ -130,6 +130,7 @@ void UpdateContentsList(int archiveIndex);
 void ExtractSelectedArchive(int index);
 bool IsImageFile(const std::wstring& filename);
 Bitmap* LoadThumbnailFromMemory(const char* data, size_t size, int thumbWidth, int thumbHeight);
+Bitmap* LoadThumbnailFromFile(const wchar_t* filePath, int thumbWidth, int thumbHeight);
 Bitmap* CreateThumbnail(Bitmap* pSource, int thumbWidth, int thumbHeight);
 INT_PTR ShowPasswordPromptDialog(HWND hwndParent, const std::wstring& archivePath, std::wstring& outPassword, bool& outSavePassword);
 void ShowSettingsDialog(HWND hwndParent);
@@ -690,21 +691,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             int width = LOWORD(lParam);
             int height = HIWORD(lParam);
 
-            MoveWindow(g_hPathEdit, 10, 10, (width - 480 > 100) ? (width - 480) : 100, 25, TRUE);
-            MoveWindow(g_hBrowseBtn, width - 460, 10, 90, 25, TRUE);
-            MoveWindow(g_hViewToggleBtn, width - 360, 10, 90, 25, TRUE);
-            HWND hSettings = GetDlgItem(hWnd, IDC_SETTINGS_BTN);
-            MoveWindow(hSettings, width - 260, 10, 90, 25, TRUE);
-            MoveWindow(g_hExtractBtn, width - 160, 10, 150, 25, TRUE);
-
+            int pathEditWidth = (width - 480 > 100) ? (width - 480) : 100;
             int leftWidth = g_splitPos - 10;
             int rightX = g_splitPos + 10;
             int rightWidth = width - g_splitPos - 20;
 
-            MoveWindow(g_hArchiveList, 10, 45, leftWidth, height - 55, TRUE);
-            MoveWindow(g_hContentsList, rightX, 45, rightWidth, height - 55, TRUE);
-            if (g_hGridViewWnd) {
-                MoveWindow(g_hGridViewWnd, rightX, 45, rightWidth, height - 55, TRUE);
+            HDWP hdwp = BeginDeferWindowPos(8);
+            if (hdwp) {
+                hdwp = DeferWindowPos(hdwp, g_hPathEdit, NULL, 10, 10, pathEditWidth, 25, SWP_NOZORDER | SWP_NOACTIVATE);
+                hdwp = DeferWindowPos(hdwp, g_hBrowseBtn, NULL, width - 460, 10, 90, 25, SWP_NOZORDER | SWP_NOACTIVATE);
+                hdwp = DeferWindowPos(hdwp, g_hViewToggleBtn, NULL, width - 360, 10, 90, 25, SWP_NOZORDER | SWP_NOACTIVATE);
+                HWND hSettings = GetDlgItem(hWnd, IDC_SETTINGS_BTN);
+                if (hSettings) {
+                    hdwp = DeferWindowPos(hdwp, hSettings, NULL, width - 260, 10, 90, 25, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+                hdwp = DeferWindowPos(hdwp, g_hExtractBtn, NULL, width - 160, 10, 150, 25, SWP_NOZORDER | SWP_NOACTIVATE);
+                hdwp = DeferWindowPos(hdwp, g_hArchiveList, NULL, 10, 45, leftWidth, height - 55, SWP_NOZORDER | SWP_NOACTIVATE);
+                hdwp = DeferWindowPos(hdwp, g_hContentsList, NULL, rightX, 45, rightWidth, height - 55, SWP_NOZORDER | SWP_NOACTIVATE);
+                if (g_hGridViewWnd) {
+                    hdwp = DeferWindowPos(hdwp, g_hGridViewWnd, NULL, rightX, 45, rightWidth, height - 55, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+                EndDeferWindowPos(hdwp);
             }
             break;
         }
@@ -751,9 +758,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                 GetClientRect(hWnd, &rect);
                 int width = rect.right;
                 if (x > 150 && x < width - 150) {
-                    g_splitPos = x - 5;
-                    SendMessage(hWnd, WM_SIZE, 0, MAKELPARAM(rect.right, rect.bottom));
-                    InvalidateRect(hWnd, NULL, TRUE);
+                    int newSplitPos = x - 5;
+                    if (newSplitPos != g_splitPos) {
+                        g_splitPos = newSplitPos;
+                        SendMessage(hWnd, WM_SIZE, 0, MAKELPARAM(rect.right, rect.bottom));
+                        
+                        RECT splitRect;
+                        splitRect.left = g_splitPos - 15;
+                        splitRect.right = g_splitPos + 15;
+                        splitRect.top = 45;
+                        splitRect.bottom = rect.bottom;
+                        InvalidateRect(hWnd, &splitRect, TRUE);
+                    }
                 }
             } else {
                 if (x >= g_splitPos && x <= g_splitPos + 10 && y >= 45) {
@@ -1075,6 +1091,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                 std::wstring enteredPwd;
                 if (OpenArchiveWithPasswordSupport(reader, filePath, hWnd, enteredPwd)) {
                     auto files = reader.ListFiles();
+                    
+                    // Extract thumbnail of first image file synchronously
+                    Gdiplus::Bitmap* thumbnail = nullptr;
+                    std::string firstImageInternalPath;
+                    for (const auto& file : files) {
+                        if (!file.isDirectory && IsImageFile(file.name)) {
+                            firstImageInternalPath = file.internalPath;
+                            break;
+                        }
+                    }
+                    if (!firstImageInternalPath.empty()) {
+                        std::vector<char> buffer;
+                        if (reader.ExtractFileToMemory(firstImageInternalPath, buffer)) {
+                            thumbnail = LoadThumbnailFromMemory(buffer.data(), buffer.size(), 64, 64);
+                        }
+                    }
                     reader.Close();
                     
                     EnterCriticalSection(&g_csArchives);
@@ -1083,6 +1115,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                         g_archives[archiveIndex].currentPassword = enteredPwd;
                         g_archives[archiveIndex].isEncrypted = true;
                         g_archives[archiveIndex].metadataLoaded = true;
+                        if (thumbnail) {
+                            if (g_archives[archiveIndex].thumbnail) delete g_archives[archiveIndex].thumbnail;
+                            g_archives[archiveIndex].thumbnail = thumbnail;
+                        }
+                    } else {
+                        if (thumbnail) delete thumbnail;
                     }
                     LeaveCriticalSection(&g_csArchives);
                     
@@ -1169,6 +1207,18 @@ Bitmap* LoadThumbnailFromMemory(const char* data, size_t size, int thumbWidth, i
         delete pOrig;
     }
     pStream->Release(); // Releases stream and frees hBuffer
+    return pThumb;
+}
+
+Bitmap* LoadThumbnailFromFile(const wchar_t* filePath, int thumbWidth, int thumbHeight) {
+    Bitmap* pOrig = Bitmap::FromFile(filePath);
+    Bitmap* pThumb = nullptr;
+    if (pOrig) {
+        if (pOrig->GetLastStatus() == Ok) {
+            pThumb = CreateThumbnail(pOrig, thumbWidth, thumbHeight);
+        }
+        delete pOrig;
+    }
     return pThumb;
 }
 
@@ -1958,6 +2008,25 @@ int g_selectedGridIndex = -1;
 int g_hoverGridIndex = -1;
 int g_gridScrollPos = 0;
 
+void GetGridLayoutParams(int wndWidth, int& outCols, int& outCardWidth, int& outCardHeight, int& outMargin) {
+    outMargin = 15;
+    outCardHeight = 140;
+    int minCardWidth = 105;
+    
+    if (wndWidth <= 0) {
+        outCols = 1;
+        outCardWidth = minCardWidth;
+        return;
+    }
+    
+    outCols = (wndWidth - outMargin) / (minCardWidth + outMargin);
+    if (outCols < 1) outCols = 1;
+    
+    // Distribute remaining space by scaling cardWidth up
+    outCardWidth = (wndWidth - (outCols + 1) * outMargin) / outCols;
+    if (outCardWidth < minCardWidth) outCardWidth = minCardWidth;
+}
+
 struct GridLoadThreadParams {
     std::wstring archivePath;
     std::wstring password;
@@ -1986,11 +2055,13 @@ DWORD WINAPI GridThumbnailLoaderThread(LPVOID lpParam) {
 
         if (cancel) break;
 
-        // Find next item to load, prioritizing visible ones in the viewport first
+        // Find next batch of items to load
         EnterCriticalSection(&g_csGridItems);
         size_t total = g_gridItems.size();
-        GridItemCache* pItem = nullptr;
-        int itemIndex = -1;
+        
+        std::vector<int> batchIndexes;
+        std::vector<std::string> batchPaths;
+        std::vector<std::wstring> batchNames;
 
         int wndHeight = 0;
         int wndWidth = 0;
@@ -2000,46 +2071,41 @@ DWORD WINAPI GridThumbnailLoaderThread(LPVOID lpParam) {
             wndHeight = rect.bottom;
             wndWidth = rect.right;
         }
-        int cols = 1;
-        if (wndWidth > 0) {
-            int cardWidth = 120;
-            int margin = 15;
-            cols = (wndWidth - margin) / (cardWidth + margin);
-            if (cols < 1) cols = 1;
-        }
+        int cols, cardWidth, cardHeight, margin;
+        GetGridLayoutParams(wndWidth, cols, cardWidth, cardHeight, margin);
 
-        // 1. Try to find the first visible, un-attempted item
+        // 1. Try to find visible, un-attempted items first
         for (size_t i = 0; i < total; ++i) {
             if (!g_gridItems[i].pBitmap && !g_gridItems[i].loadAttempted) {
                 int row = (int)i / cols;
-                int itemY = 15 + row * (140 + 15) - g_gridScrollPos;
-                if (itemY + 140 >= 0 && itemY <= wndHeight) {
-                    pItem = &g_gridItems[i];
-                    itemIndex = (int)i;
-                    break;
+                int itemY = margin + row * (cardHeight + margin) - g_gridScrollPos;
+                if (itemY + cardHeight >= 0 && itemY <= wndHeight) {
+                    batchIndexes.push_back((int)i);
+                    batchPaths.push_back(g_gridItems[i].internalPath);
+                    batchNames.push_back(g_gridItems[i].name);
+                    if (batchIndexes.size() >= 8) break;
                 }
             }
         }
 
-        // 2. If no visible items need loading, fall back to sequential from the start
-        if (!pItem) {
+        // 2. If we didn't fill the batch, fall back to sequential items
+        if (batchIndexes.size() < 8) {
             for (size_t i = 0; i < total; ++i) {
                 if (!g_gridItems[i].pBitmap && !g_gridItems[i].loadAttempted) {
-                    pItem = &g_gridItems[i];
-                    itemIndex = (int)i;
-                    break;
+                    if (std::find(batchIndexes.begin(), batchIndexes.end(), (int)i) == batchIndexes.end()) {
+                        batchIndexes.push_back((int)i);
+                        batchPaths.push_back(g_gridItems[i].internalPath);
+                        batchNames.push_back(g_gridItems[i].name);
+                        if (batchIndexes.size() >= 8) break;
+                    }
                 }
             }
         }
         LeaveCriticalSection(&g_csGridItems);
 
-        if (!pItem) {
+        if (batchIndexes.empty()) {
             break; // No more items to load
         }
-
-        // We have an item to load! Get the internal path and name
-        std::string internalPath = pItem->internalPath;
-        std::wstring name = pItem->name;
 
         // Open reader if not already opened
         if (!readerOpened) {
@@ -2067,37 +2133,80 @@ DWORD WINAPI GridThumbnailLoaderThread(LPVOID lpParam) {
         LeaveCriticalSection(&g_csGridLoad);
         if (cancel) break;
 
-        std::vector<char> buffer;
-        Gdiplus::Bitmap* pThumb = nullptr;
-        if (reader.ExtractFileToMemory(internalPath, buffer)) {
-            pThumb = LoadThumbnailFromMemory(buffer.data(), buffer.size(), 100, 100);
+        // Perform batch extraction if using 7-Zip
+        bool batchSuccess = false;
+        std::wstring tempDir = GetAppTempRoot() + L"\\GridBatch_" + std::to_wstring(sessionId) + L"_" + std::to_wstring(batchIndexes[0]);
+        if (reader.Uses7Zip()) {
+            batchSuccess = reader.ExtractFilesToDisk(batchPaths, tempDir);
         }
 
-        // Check session validity again before writing back to globals
-        EnterCriticalSection(&g_csGridLoad);
-        bool sessionValid = (g_gridLoadSessionId == sessionId);
-        LeaveCriticalSection(&g_csGridLoad);
+        for (size_t k = 0; k < batchIndexes.size(); ++k) {
+            int itemIndex = batchIndexes[k];
+            std::string internalPath = batchPaths[k];
+            std::wstring name = batchNames[k];
 
-        if (sessionValid) {
-            EnterCriticalSection(&g_csGridItems);
-            // Verify the item at itemIndex is still the same one (in case grid items were cleared/updated)
-            if (itemIndex < (int)g_gridItems.size() && g_gridItems[itemIndex].name == name) {
-                if (pThumb) {
-                    g_gridItems[itemIndex].pBitmap = pThumb;
-                } else {
-                    g_gridItems[itemIndex].loadAttempted = true;
+            // Double check cancellation for each file in the batch
+            EnterCriticalSection(&g_csGridLoad);
+            cancel = g_bCancelGridLoad || (g_gridLoadSessionId != sessionId);
+            LeaveCriticalSection(&g_csGridLoad);
+            if (cancel) break;
+
+            Gdiplus::Bitmap* pThumb = nullptr;
+
+            if (reader.Uses7Zip()) {
+                if (batchSuccess) {
+                    std::wstring wpath = Utf8ToWString(internalPath);
+                    for (auto& ch : wpath) {
+                        if (ch == L'/') ch = L'\\';
+                    }
+                    std::wstring diskPath = tempDir + L"\\" + wpath;
+                    if (fs::exists(diskPath)) {
+                        pThumb = LoadThumbnailFromFile(diskPath.c_str(), 100, 100);
+                    }
                 }
+            } else {
+                // Zip file, extract in-memory directly
+                std::vector<char> buffer;
+                if (reader.ExtractFileToMemory(internalPath, buffer)) {
+                    pThumb = LoadThumbnailFromMemory(buffer.data(), buffer.size(), 100, 100);
+                }
+            }
+
+            // Check session validity again before writing back to globals
+            EnterCriticalSection(&g_csGridLoad);
+            bool sessionValid = (g_gridLoadSessionId == sessionId);
+            LeaveCriticalSection(&g_csGridLoad);
+
+            if (sessionValid) {
+                EnterCriticalSection(&g_csGridItems);
+                // Verify the item at itemIndex is still the same one (in case grid items were cleared/updated)
+                if (itemIndex < (int)g_gridItems.size() && g_gridItems[itemIndex].name == name) {
+                    if (pThumb) {
+                        g_gridItems[itemIndex].pBitmap = pThumb;
+                    } else {
+                        g_gridItems[itemIndex].loadAttempted = true;
+                    }
+                } else {
+                    if (pThumb) delete pThumb;
+                }
+                LeaveCriticalSection(&g_csGridItems);
             } else {
                 if (pThumb) delete pThumb;
             }
-            LeaveCriticalSection(&g_csGridItems);
+        }
 
-            if (g_hGridViewWnd) {
-                InvalidateRect(g_hGridViewWnd, NULL, FALSE);
-            }
-        } else {
-            if (pThumb) delete pThumb;
-            break; // Session changed, exit thread immediately
+        // Clean up temp batch folder if created
+        if (reader.Uses7Zip()) {
+            std::error_code ec;
+            fs::remove_all(tempDir, ec);
+        }
+
+        // Repaint grid
+        EnterCriticalSection(&g_csGridLoad);
+        bool sessionValid = (g_gridLoadSessionId == sessionId);
+        LeaveCriticalSection(&g_csGridLoad);
+        if (sessionValid && g_hGridViewWnd) {
+            InvalidateRect(g_hGridViewWnd, NULL, FALSE);
         }
     }
 
@@ -2165,12 +2274,11 @@ void UpdateGridItems(const std::vector<ArchiveFileInfo>& files, const std::wstri
     if (g_hGridViewWnd) {
         SCROLLINFO si = { 0 };
         si.cbSize = sizeof(si);
-        si.fMask = SIF_POS | SIF_RANGE;
+        si.fMask = SIF_POS;
         si.nPos = 0;
-        si.nMin = 0;
-        si.nMax = 0;
         SetScrollInfo(g_hGridViewWnd, SB_VERT, &si, TRUE);
-        InvalidateRect(g_hGridViewWnd, NULL, TRUE);
+        
+        SendMessageW(g_hGridViewWnd, WM_SIZE, 0, 0);
     }
 }
 
@@ -2209,11 +2317,8 @@ LRESULT CALLBACK GridViewWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             int width = rect.right;
             int height = rect.bottom;
 
-            int cardWidth = 120;
-            int cardHeight = 140;
-            int margin = 15;
-            int cols = (width - margin) / (cardWidth + margin);
-            if (cols < 1) cols = 1;
+            int cols, cardWidth, cardHeight, margin;
+            GetGridLayoutParams(width, cols, cardWidth, cardHeight, margin);
 
             EnterCriticalSection(&g_csGridItems);
             int totalItems = (int)g_gridItems.size();
@@ -2305,11 +2410,8 @@ LRESULT CALLBACK GridViewWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             GetClientRect(hWnd, &rect);
             int width = rect.right;
 
-            int cardWidth = 120;
-            int cardHeight = 140;
-            int margin = 15;
-            int cols = (width - margin) / (cardWidth + margin);
-            if (cols < 1) cols = 1;
+            int cols, cardWidth, cardHeight, margin;
+            GetGridLayoutParams(width, cols, cardWidth, cardHeight, margin);
 
             EnterCriticalSection(&g_csGridItems);
             int totalItems = (int)g_gridItems.size();
@@ -2357,11 +2459,8 @@ LRESULT CALLBACK GridViewWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             GetClientRect(hWnd, &rect);
             int width = rect.right;
 
-            int cardWidth = 120;
-            int cardHeight = 140;
-            int margin = 15;
-            int cols = (width - margin) / (cardWidth + margin);
-            if (cols < 1) cols = 1;
+            int cols, cardWidth, cardHeight, margin;
+            GetGridLayoutParams(width, cols, cardWidth, cardHeight, margin);
 
             EnterCriticalSection(&g_csGridItems);
             int totalItems = (int)g_gridItems.size();
@@ -2441,11 +2540,8 @@ LRESULT CALLBACK GridViewWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 
             FillRect(hdcMem, &rect, g_hPanelBgBrush);
 
-            int cardWidth = 120;
-            int cardHeight = 140;
-            int margin = 15;
-            int cols = (width - margin) / (cardWidth + margin);
-            if (cols < 1) cols = 1;
+            int cols, cardWidth, cardHeight, margin;
+            GetGridLayoutParams(width, cols, cardWidth, cardHeight, margin);
 
             EnterCriticalSection(&g_csGridItems);
             int totalItems = (int)g_gridItems.size();

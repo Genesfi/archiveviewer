@@ -31,7 +31,9 @@ public:
     std::vector<ArchiveFileInfo> ListFiles() const;
     bool ExtractFileToMemory(const std::string& internalPath, std::vector<char>& outBuffer) const;
     bool ExtractFileToDisk(const std::string& internalPath, const std::wstring& destDiskPath) const;
+    bool ExtractFilesToDisk(const std::vector<std::string>& internalPaths, const std::wstring& destDirectoryPath) const;
     bool ExtractAll(const std::wstring& destDirectoryPath) const;
+    bool Uses7Zip() const;
 
     void SetCancelFlag(const bool* pCancel) { m_pCancelFlag = pCancel; }
 
@@ -52,3 +54,4 @@ private:
 };
 
 bool IsNonFirstMultiPartVolume(const std::wstring& filePath);
+std::wstring Utf8ToWString(const std::string& str);

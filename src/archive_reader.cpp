@@ -174,7 +174,7 @@ bool RunCommandAndGetOutput(const std::wstring& cmd, std::string& output, int& e
                 output.append(chBuf, dwRead);
             }
         } else {
-            DWORD dwWait = WaitForSingleObject(piProcInfo.hProcess, 50);
+            DWORD dwWait = WaitForSingleObject(piProcInfo.hProcess, 5);
             if (dwWait == WAIT_OBJECT_0) {
                 // Read remaining data
                 while (ReadFile(hChildStd_OUT_Rd, chBuf, sizeof(chBuf) - 1, &dwRead, NULL) && dwRead > 0) {
@@ -795,6 +795,50 @@ bool ArchiveReader::ExtractAll(const std::wstring& destDirectoryPath) const {
     }
     return true;
 }
+
+bool ArchiveReader::ExtractFilesToDisk(const std::vector<std::string>& internalPaths, const std::wstring& destDirectoryPath) const {
+    if (!m_isOpen || !m_impl) return false;
+    if (internalPaths.empty()) return true;
+
+    CreateDirectories(destDirectoryPath);
+
+    if (m_impl->use7Zip) {
+        std::wstring cmd = L"\"" + m_impl->sevenZipPath + L"\" x -y -sccUTF-8 -o\"" + destDirectoryPath + L"\" \"" + m_archivePath + L"\"";
+        if (!m_password.empty()) {
+            cmd += L" -p\"" + m_password + L"\"";
+        } else {
+            cmd += L" -p-";
+        }
+
+        for (const auto& path : internalPaths) {
+            cmd += L" \"" + Utf8ToWString(path) + L"\"";
+        }
+
+        std::string output;
+        int exitCode = 0;
+        if (!RunCommandAndGetOutput(cmd, output, exitCode, m_pCancelFlag) || exitCode != 0) {
+            return false;
+        }
+        return true;
+    } else {
+        for (const auto& path : internalPaths) {
+            std::wstring wpath = Utf8ToWString(path);
+            for (auto& ch : wpath) {
+                if (ch == L'/') ch = L'\\';
+            }
+            std::wstring destPath = destDirectoryPath + L"\\" + wpath;
+            if (!ExtractFileToDisk(path, destPath)) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+bool ArchiveReader::Uses7Zip() const {
+    return m_isOpen && m_impl && m_impl->use7Zip;
+}
+
 
 bool IsNonFirstMultiPartVolume(const std::wstring& filePath) {
     size_t dotPos = filePath.find_last_of(L'.');
