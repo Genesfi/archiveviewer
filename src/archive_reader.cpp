@@ -445,10 +445,37 @@ bool ArchiveReader::Open(const std::wstring& archivePath, const std::wstring& pa
         return false;
     }
 
-    std::wstring ext;
-    size_t dotPos = archivePath.find_last_of(L'.');
-    if (dotPos != std::wstring::npos) {
-        ext = archivePath.substr(dotPos);
+    std::wstring ext = L".ZIP";
+    FILE* testFile = _wfopen(archivePath.c_str(), L"rb");
+    if (testFile) {
+        char magic[6] = { 0 };
+        size_t readBytes = fread(magic, 1, sizeof(magic), testFile);
+        fclose(testFile);
+        
+        if (readBytes >= 4) {
+            if (magic[0] == 'P' && magic[1] == 'K' && magic[2] == 3 && magic[3] == 4) {
+                ext = L".ZIP";
+            } else if (magic[0] == 'R' && magic[1] == 'a' && magic[2] == 'r' && magic[3] == '!') {
+                ext = L".RAR";
+            } else if (magic[0] == '7' && magic[1] == 'z' && (unsigned char)magic[2] == 0xbc && (unsigned char)magic[3] == 0xaf) {
+                ext = L".7Z";
+            } else {
+                size_t dotPos = archivePath.find_last_of(L'.');
+                if (dotPos != std::wstring::npos) {
+                    ext = archivePath.substr(dotPos);
+                }
+            }
+        } else {
+            size_t dotPos = archivePath.find_last_of(L'.');
+            if (dotPos != std::wstring::npos) {
+                ext = archivePath.substr(dotPos);
+            }
+        }
+    } else {
+        size_t dotPos = archivePath.find_last_of(L'.');
+        if (dotPos != std::wstring::npos) {
+            ext = archivePath.substr(dotPos);
+        }
     }
     for (auto& ch : ext) ch = towupper(ch);
 
@@ -572,6 +599,24 @@ bool ArchiveReader::OpenFromStream(IStream* pStream, const std::wstring& extensi
     if (!pStream) return false;
     
     std::wstring ext = extension;
+    char magic[6] = { 0 };
+    ULONG bytesReadMagic = 0;
+    LARGE_INTEGER liZero = { 0 };
+    HRESULT seekHr = pStream->Seek(liZero, STREAM_SEEK_SET, NULL);
+    if (SUCCEEDED(seekHr)) {
+        HRESULT readHr = pStream->Read(magic, sizeof(magic), &bytesReadMagic);
+        pStream->Seek(liZero, STREAM_SEEK_SET, NULL);
+        
+        if (SUCCEEDED(readHr) && bytesReadMagic >= 4) {
+            if (magic[0] == 'P' && magic[1] == 'K' && magic[2] == 3 && magic[3] == 4) {
+                ext = L".ZIP";
+            } else if (magic[0] == 'R' && magic[1] == 'a' && magic[2] == 'r' && magic[3] == '!') {
+                ext = L".RAR";
+            } else if (magic[0] == '7' && magic[1] == 'z' && (unsigned char)magic[2] == 0xbc && (unsigned char)magic[3] == 0xaf) {
+                ext = L".7Z";
+            }
+        }
+    }
     for (auto& ch : ext) ch = towupper(ch);
     
     if (ext == L".ZIP" && password.empty()) {
@@ -631,7 +676,6 @@ bool ArchiveReader::OpenFromStream(IStream* pStream, const std::wstring& extensi
     FILE* f = _wfopen(finalTempPath.c_str(), L"wb");
     if (!f) return false;
     
-    LARGE_INTEGER liZero = { 0 };
     pStream->Seek(liZero, STREAM_SEEK_SET, NULL);
     
     char chunk[65536];
